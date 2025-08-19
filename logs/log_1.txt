@@ -1,0 +1,12 @@
+× meal-api.service - Meal API FastAPI Service
+     Loaded: loaded (/etc/systemd/system/meal-api.service; enabled; preset: enabled)
+     Active: failed (Result: exit-code) since Tue 2025-08-19 18:27:57 KST; 5min ago
+   Duration: 2ms
+ Invocation: 28d5add5954b4bd98a84a5d3abbed773
+    Process: 30318 ExecStart=/usr/bin/python3 -m uvicorn app:app --host 0.0.0.0 --port 8000 (code=exited, status=217/USER)
+   Main PID: 30318 (code=exited, status=217/USER)
+
+Aug 19 18:27:57 bsp-user-VMware20-1 systemd[1]: meal-api.service: Scheduled restart job, restart counter is at 5.
+Aug 19 18:27:57 bsp-user-VMware20-1 systemd[1]: meal-api.service: Start request repeated too quickly.
+Aug 19 18:27:57 bsp-user-VMware20-1 systemd[1]: meal-api.service: Failed with result 'exit-code'.
+Aug 19 18:27:57 bsp-user-VMware20-1 systemd[1]: Failed to start meal-api.service - Meal API FastAPI Service.
