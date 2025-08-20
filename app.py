@@ -1,212 +1,326 @@
-import os
-import re
-import json
-import urllib.parse
-
-from fastapi.responses import RedirectResponse
-from typing import List, Optional, Literal
-
-import requests
-
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+import os, re, time, threading
+from math import radians, sin, cos, sqrt, atan2
+from typing import List, Optional, Literal, Tuple, Dict, Any
+from dataclasses import dataclass
+from contextlib import asynccontextmanager
 from functools import lru_cache
 
-# --- 환경 변수 ---
-load_dotenv()
-API_BASE = "http://openapi.seoul.go.kr:8088"
-API_KEY = os.getenv("const_KEY")
-map_KEY = os.getenv("map_KEY")
-SERVICE = "LOCALDATA_072404_GD"
-DATA_TYPE = "json"
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import RedirectResponse, ORJSONResponse
+import random as pyrandom
+from pydantic import BaseModel
 
-if not API_KEY:
+# ──────────────────────────────────────────────────────────────────────────────
+# 설정
+# ──────────────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+class Config:
+    API_BASE: str = "http://openapi.seoul.go.kr:8088"
+    API_KEY: str = os.getenv("const_KEY")
+    MAP_KEY: Optional[str] = os.getenv("map_KEY")
+    SERVICE: str = "LOCALDATA_072404_GD"
+    DATA_TYPE: str = "json"
+    CACHE_REFRESH_SEC: int = int(os.getenv("CACHE_REFRESH_SEC", "600"))
+    PREFETCH_PAGES: int = int(os.getenv("PREFETCH_PAGES", "6"))
+    PREFETCH_SIZE: int = int(os.getenv("PREFETCH_SIZE", "1000"))
+    MAX_EXCLUDE_PARAMS: int = 400
+
+if not Config.API_KEY:
     raise RuntimeError("const_KEY가 .env에 설정되어야 합니다.")
 
-# --- 앱/미들웨어 ---
-app = FastAPI(title="Seoul Food LocalData API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],       # 배포 시 프론트 도메인으로 제한 권장
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ──────────────────────────────────────────────────────────────────────────────
+# 모델
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class Restaurant:
+    id: str
+    name: str
+    open: bool
+    addr: str
+    kind: str
+    category: str
+    loc_x: Optional[float]
+    loc_y: Optional[float]
 
-# --- 유틸 ---
-OPEN_TOKENS = ("영업", "정상", "영업/정상")
+class RestaurantResponse(BaseModel):
+    total: int
+    count: int
+    items: List[Dict[str, Any]]
 
-def is_open(row: dict) -> bool:
-    trd = (row.get("TRDSTATENM") or "").strip()
-    dtl = (row.get("DTLSTATENM") or "").strip()
-    return any(tok in trd for tok in OPEN_TOKENS) and (dtl in OPEN_TOKENS or dtl == "")
+class RandomResponse(BaseModel):
+    items: List[Dict[str, Any]]
 
-def pick_addr(row: dict) -> str:
-    return (row.get("RDNWHLADDR") or row.get("SITEWHLADDR") or "").strip()
+# ──────────────────────────────────────────────────────────────────────────────
+# 유틸/분류
+# ──────────────────────────────────────────────────────────────────────────────
+class RestaurantClassifier:
+    OPEN_TOKENS = ("영업", "정상", "영업/정상")
+    RE_RULES = [
+        ("카페", re.compile(r"(카페|까페)")),
+        ("호프통닭", re.compile(r"(호프|통닭|치킨|주점|소주방|포차|이자카야|와인바|술집)")),
+        ("한", re.compile(r"(한식|냉면|분식|뷔페식|식육)")),
+        ("중", re.compile(r"(중식|중국|중화요리)")),
+        ("일", re.compile(r"(일식|스시|초밥|라멘|우동|돈카츠|규카츠|사케동|횟집)")),
+        ("양", re.compile(r"(양식|패스트푸드|외국음식전문점|피자|파스타|스테이크|버거)")),
+    ]
 
-def normalize_row(row: dict) -> dict:
-    return {
-        "name":   (row.get("BPLCNM") or "").strip(),
-        "open":   is_open(row),
-        "addr":   pick_addr(row),
-        "kind":   (row.get("UPTAENM") or row.get("SNTUPTAENM") or "").strip(),
-    }
+    @classmethod
+    def is_open(cls, row: dict) -> bool:
+        trd = (row.get("TRDSTATENM") or "").strip()
+        dtl = (row.get("DTLSTATENM") or "").strip()
+        return any(tok in trd for tok in cls.OPEN_TOKENS) and (dtl in cls.OPEN_TOKENS or dtl == "")
 
-def geocode_address(addr: str):
+    @classmethod
+    def pick_addr(cls, row: dict) -> str:
+        return (row.get("RDNWHLADDR") or row.get("SITEWHLADDR") or "").strip()
+
+    @classmethod
+    def extract_coords(cls, row: dict) -> Tuple[Optional[float], Optional[float]]:
+        for lx, ly in [("X","Y"),("LOC_X","LOC_Y"),("LON","LAT"),("longitude","latitude")]:
+            lon, lat = row.get(lx), row.get(ly)
+            if lon not in (None,"") and lat not in (None,""):
+                try: return float(lon), float(lat)
+                except: pass
+        return None, None
+
+    @classmethod
+    def classify_category(cls, raw_kind: str) -> str:
+        k = (raw_kind or "").replace(" ","")
+        for cat, pat in cls.RE_RULES:
+            if pat.search(k): return cat
+        return "etc"
+
+class Distance:
+    @staticmethod
+    def calc(lon1, lat1, lon2, lat2) -> float:
+        try:
+            lon1,lat1,lon2,lat2 = map(float,[lon1,lat1,lon2,lat2])
+        except: return float('inf')
+        R=6371000.0
+        dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
+        a=sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+        return 2*atan2(sqrt(a),sqrt(1-a))*R
+
+class Normalizer:
+    @staticmethod
+    def normalize(row: dict) -> Restaurant:
+        lon, lat = RestaurantClassifier.extract_coords(row)
+        raw_kind = (row.get("UPTAENM") or row.get("SNTUPTAENM") or "").strip()
+        category = RestaurantClassifier.classify_category(raw_kind)
+        ident = (row.get("MGTNO") or "").strip()
+        return Restaurant(
+            id=ident,
+            name=(row.get("BPLCNM") or "").strip(),
+            open=RestaurantClassifier.is_open(row),
+            addr=RestaurantClassifier.pick_addr(row),
+            kind=raw_kind,
+            category=category,
+            loc_x=lon,
+            loc_y=lat,
+        )
+
+    @staticmethod
+    def key(item: Restaurant) -> str:
+        return item.id if item.id else f"{item.name}|{item.addr}"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 외부 API (동기)
+# ──────────────────────────────────────────────────────────────────────────────
+class SeoulAPIClient:
+    def __init__(self):
+        self.base = Config.API_BASE; self.key = Config.API_KEY
+        self.svc = Config.SERVICE; self.dtype = Config.DATA_TYPE
+
+    def fetch_page(self, start: int, end: int) -> dict:
+        url = f"{self.base}/{self.key}/{self.dtype}/{self.svc}/{start}/{end}"
+        try:
+            r = requests.get(url, timeout=8); r.raise_for_status()
+            data = r.json(); svc = data.get(self.svc)
+            return svc if svc else {"row":[]}
+        except requests.RequestException as e:
+            raise HTTPException(502, detail=f"Upstream API error: {e}")
+        except Exception as e:
+            raise HTTPException(502, detail=f"Data processing error: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 캐시
+# ──────────────────────────────────────────────────────────────────────────────
+class RestaurantCache:
+    def __init__(self):
+        self._data: List[Restaurant] = []; self._ts: float = 0.0
+        self._lock = threading.Lock(); self._cli = SeoulAPIClient()
+
+    def get(self) -> List[Restaurant]:
+        with self._lock: return list(self._data)
+
+    def ts(self) -> float:
+        with self._lock: return self._ts
+
+    def refresh(self, pages=Config.PREFETCH_PAGES, size=Config.PREFETCH_SIZE):
+        raw = []
+        for i in range(pages):
+            start = 1 + size*i; end = size*(i+1)
+            resp = self._cli.fetch_page(start,end)
+            rows = resp.get("row",[]) or []
+            if not rows: break
+            raw.extend(rows)
+        norm = [Normalizer.normalize(r) for r in raw]
+        with self._lock:
+            self._data = norm; self._ts = time.time()
+
+    def start_loop(self):
+        def loop():
+            while True:
+                try: self.refresh()
+                except Exception as e: print("Cache refresh error:", e)
+                time.sleep(Config.CACHE_REFRESH_SEC)
+        threading.Thread(target=loop, daemon=True).start()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 필터
+# ──────────────────────────────────────────────────────────────────────────────
+class Filter:
+    def __init__(self, cache: RestaurantCache):
+        self.cache = cache
+
+    def _area_patterns(self, area: Optional[str]) -> List[re.Pattern]:
+        if not area: return []
+        return [re.compile(re.escape(t.strip())) for t in area.split(",") if t.strip()]
+
+    def _area_match(self, addr: str, pats: List[re.Pattern]) -> bool:
+        if not pats: return True
+        return any(p.search(addr) for p in pats)
+
+    def _kind_match(self, cat: str, kind: Optional[str]) -> bool:
+        if kind in (None,"전체"): return True
+        if kind == "etc": return cat not in {"한","중","일","양","카페","호프통닭"}
+        return cat == kind
+
+    def filter(
+        self, *, query: Optional[str], area: Optional[str], kind: Optional[str], open_only: bool,
+        curr_loc_x: Optional[float], curr_loc_y: Optional[float], distance: Optional[int],
+        exclude: Optional[List[str]], order: str, seed: Optional[int]
+    ) -> List[Restaurant]:
+        data = self.cache.get()
+        pats = self._area_patterns(area)
+        q = (query or "").strip().lower()
+        exclude_set = set(exclude or [])
+        want_dist = (curr_loc_x is not None and curr_loc_y is not None and distance is not None)
+
+        out: List[Restaurant] = []
+        for r in data:
+            if exclude_set and Normalizer.key(r) in exclude_set: continue
+            if open_only and not r.open: continue
+            if not self._kind_match(r.category, kind): continue
+            if area and not self._area_match(r.addr, pats): continue
+            if q and (q not in (r.name or "").lower()): continue
+            if want_dist and r.loc_x is not None and r.loc_y is not None:
+                if Distance.calc(curr_loc_x, curr_loc_y, r.loc_x, r.loc_y) > float(distance):
+                    continue
+            out.append(r)
+
+        if order == "rand":
+            rng = pyrandom.Random(seed) if seed is not None else pyrandom
+            rng.shuffle(out)
+        return out
+
+# ──────────────────────────────────────────────────────────────────────────────
+# App & Lifespan
+# ──────────────────────────────────────────────────────────────────────────────
+cache = RestaurantCache()
+flt = Filter(cache)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cache.start_loop()
+    yield
+
+app = FastAPI(title="Seoul Food LocalData API", default_response_class=ORJSONResponse, lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Geocoding (간단 캐시)
+# ──────────────────────────────────────────────────────────────────────────────
+@lru_cache(maxsize=1024)
+def geocode(addr: str):
+    if not Config.MAP_KEY: return None
     url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": addr, "key": map_KEY}
-    res = requests.get(url, params=params).json()
-    if res["status"] != "OK":
-        return None
-    loc = res["results"][0]["geometry"]["location"]
-    return loc  # {'lat': 37.123, 'lng': 127.456}
-
-def fetch_page(start: int, end: int) -> dict:
-    url = f"{API_BASE}/{API_KEY}/{DATA_TYPE}/{SERVICE}/{start}/{end}"
-    r = requests.get(url, timeout=8)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Upstream HTTP {r.status_code}")
     try:
-        data = r.json()
+        res = requests.get(url, params={"address": addr, "key": Config.MAP_KEY}, timeout=8).json()
+        if res.get("status") != "OK": return None
+        loc = res["results"][0]["geometry"]["location"]
+        return (loc["lat"], loc["lng"])
     except Exception:
-        # xml로 사유 확인이 필요한 경우가 있으나 여기선 그대로 반환
-        raise HTTPException(status_code=502, detail="Upstream JSON decode error")
-    # 공공API는 실패도 200으로 내려줄 수 있음
-    svc = data.get(SERVICE)
-    if not svc:
-        # 더 이상 데이터 없음
-        return {"row": []}
-    return svc
+        return None
 
-# 간단 캐시: 동일 구간 조회는 짧게 메모리 캐싱
-@lru_cache(maxsize=256)
-def get_rows_range(start: int, end: int) -> list:
-    svc = fetch_page(start, end)
-    rows = svc.get("row", []) or []
-    return rows
-
-def iter_rows(pages: int = 6, size: int = 1000):
-    """
-    필요한 만큼만 페이지 순회 (기본 3, 성능/쿼터 고려)
-    """
-    for i in range(pages):
-        start = 1 + size * i
-        end = size * (i + 1)
-        rows = get_rows_range(start, end)
-        if not rows:
-            break
-        for row in rows:
-            yield row
-
-# --- API ---
+# ──────────────────────────────────────────────────────────────────────────────
+# API
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
-def health():
-    return {"ok": True}
+async def health():
+    return {"ok": True, "cache_ts": cache.ts(), "prefetched": len(cache.get())}
 
-@app.get("/init/load")
-def init_load():
-    rows_all = []
-    rows_ko = []
-    rows_ch = []
-    rows_jp = []
-    rows_en = []
-    rows_etc = []
-
-    for row in iter_rows(pages=6, size=1000):
-        rows_all.append(row)
-        if "한" in row.get("UPTAENM") :
-            rows_ko.append(row)
-        elif "중" in row.get("UPTAENM") :
-            rows_ch.append(row)
-        elif "일" in row.get("UPTAENM") :
-            rows_jp.append(row)
-        elif "양" in row.get("UPTAENM") :
-            rows_en.append(row)
-        else:
-            rows_etc.append(row)
-    return rows_ko
-    
-    
-@app.get("/photo/street")
-def photo_street(addr: str, w: int = 600, h: int = 360, fov: int = 90, heading: int = 0, pitch: int = 0):
-    loc = geocode_address(addr)
-    if not loc:
-        raise HTTPException(400, detail=f"Geocoding failed for {addr}")
-    lat, lng = loc["lat"], loc["lng"]
-
-    url = (f"https://maps.googleapis.com/maps/api/streetview"
-           f"?size={w}x{h}&location={lat},{lng}&fov={fov}&heading={heading}&pitch={pitch}&key={map_KEY}")
-    return RedirectResponse(url)
-
-@app.get("/restaurants")
-def list_restaurants(
-    q: Optional[str] = Query(None, description="가게명 부분검색"),
-    area: Optional[str] = Query(None, description="지역 키워드들(쉼표구분). 예: 상일,고덕"),
-    kind: Optional[Literal["전체", "한", "중", "일", "양", "etc"]] = Query(None),
+@app.get("/restaurants", response_model=RestaurantResponse)
+async def list_restaurants(
+    q: Optional[str] = Query(None),
+    area: Optional[str] = Query(None),
+    kind: Optional[Literal["전체","한","중","일","양","카페","호프통닭","etc"]] = Query(None),
     open_only: bool = Query(True),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(20, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    pages: int = Query(6, ge=1, le=50),   # 얼마나 페이지를 스캔할지 (너무 크면 느려짐/쿼터 소모)
-    size: int = Query(1000, ge=1, le=1000)
+    curr_loc_x: Optional[float] = Query(None),
+    curr_loc_y: Optional[float] = Query(None),
+    distance: Optional[int] = Query(None),
+    exclude: Optional[List[str]] = Query(None),
+    order: Optional[Literal["default","rand"]] = Query("default"),
+    seed: Optional[int] = Query(None)
 ):
-    # 필터 준비
-    area_patterns: List[re.Pattern] = []
-    if area:
-        tokens = [t.strip() for t in area.split(",") if t.strip()]
-        area_patterns = [re.compile(re.escape(tok)) for tok in tokens]
+    if exclude and len(exclude) > Config.MAX_EXCLUDE_PARAMS:
+        exclude = exclude[-Config.MAX_EXCLUDE_PARAMS:]
 
-    def area_match(addr: str) -> bool:
-        if not area_patterns:
-            return True
-        return any(p.search(addr) for p in area_patterns)
-
-# 수집
-    items = []
-    for row in iter_rows(pages=pages, size=size):
-        n = normalize_row(row)
-
-        # 1) 업종: kind가 None 이거나 "전체"면 모두 허용, 아니면 한/중/일 이란 단어 포함시 허용
-        if kind not in (None, "전체") and not any(k in n["kind"] for k in kind):
-            continue
-
-        # 2) 영업 여부
-        if open_only and not n["open"]:
-            continue
-
-        # 3) 지역
-        if not area_match(n["addr"]):
-            continue
-
-        # 4) 이름 검색 (대소문자 구분 없이 하고 싶으면 둘 다 lower())
-        if q and q not in n["name"]:
-            continue
-
-        items.append(n)
-
+    items = flt.filter(
+        query=q, area=area, kind=kind, open_only=open_only,
+        curr_loc_x=curr_loc_x, curr_loc_y=curr_loc_y, distance=distance,
+        exclude=exclude, order=order, seed=seed
+    )
     total = len(items)
-    items = items[offset: offset + limit]
-    return {"total": total, "count": len(items), "items": items}
+    page = items[offset: offset+limit]
 
-@app.get("/restaurants/random")
-def random_restaurants(
-    area: Optional[str] = None,
-    kind: Optional[Literal["전체","한", "중", "일", "양", "etc"]] = None,
-    open_only: bool = True,
-    pages: int = 6,
-    size: int = 1000,
-    count: int = Query(5, ge=1, le=20, description="랜덤으로 뽑을 개수 (기본 5개)")
-):
-    import random
-    # /restaurants와 같은 필터 로직 재사용
-    resp = list_restaurants(q=None, area=area, kind=kind, open_only=open_only,
-                            limit=10000, offset=0, pages=pages, size=size)
-    items = resp["items"]
-    if not items:
-        raise HTTPException(status_code=404, detail="조건에 맞는 가게가 없습니다.")
+    # 선택: 서버에서 distance(m) 계산해서 내려주기(프론트 표시용)
+    if curr_loc_x is not None and curr_loc_y is not None:
+        out = []
+        for r in page:
+            d = None
+            if r.loc_x is not None and r.loc_y is not None:
+                d = Distance.calc(curr_loc_x, curr_loc_y, r.loc_x, r.loc_y)
+            obj = r.__dict__.copy()
+            if d is not None: obj["distance"] = round(float(d), 2)
+            out.append(obj)
+    else:
+        out = [r.__dict__ for r in page]
 
-    # 요청한 개수보다 items가 적으면 전체 반환
-    if len(items) <= count:
-        return items
-    return random.sample(items, count)
+    return RestaurantResponse(total=total, count=len(out), items=out)
 
+@app.get("/restaurants/random", response_model=RandomResponse)
+async def random_restaurants(open_only: bool = True, count: int = Query(1, ge=1, le=20)):
+    pool = [r for r in cache.get() if (r.open if open_only else True)]
+    if not pool: raise HTTPException(404, detail="가져올 항목이 없습니다.")
+    sel = pool if len(pool)<=count else pyrandom.sample(pool, count)
+    return RandomResponse(items=[r.__dict__ for r in sel])
+
+@app.get("/photo/street")
+async def photo_street(addr: str, w: int=600, h: int=360, fov: int=90, heading: int=0, pitch: int=0):
+    if not Config.MAP_KEY:
+        raise HTTPException(400, detail="Google Maps API key not configured")
+    latlng = geocode(addr)
+    if not latlng: raise HTTPException(400, detail="Geocoding failed")
+    lat,lng = latlng
+    url = ("https://maps.googleapis.com/maps/api/streetview"
+           f"?size={w}x{h}&location={lat},{lng}&fov={fov}&heading={heading}&pitch={pitch}&key={Config.MAP_KEY}")
+    return RedirectResponse(url)
