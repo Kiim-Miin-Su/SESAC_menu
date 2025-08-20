@@ -41,6 +41,7 @@ class Config:
         "https://sesac-menu.pe.kr",  # 프론트 도메인
         "http://localhost:5173",     # 로컬 개발(원하면 제거)
         "http://127.0.0.1:5173",
+        "https://kiim-miin-su.github.io",
     ]
 
     # 레이트리밋 정책(필요 시 조절)
