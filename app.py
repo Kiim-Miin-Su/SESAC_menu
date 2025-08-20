@@ -86,7 +86,7 @@ def get_rows_range(start: int, end: int) -> list:
     rows = svc.get("row", []) or []
     return rows
 
-def iter_rows(pages: int = 3, size: int = 1000):
+def iter_rows(pages: int = 10, size: int = 1000):
     """
     필요한 만큼만 페이지 순회 (기본 3, 성능/쿼터 고려)
     """
@@ -104,6 +104,14 @@ def iter_rows(pages: int = 3, size: int = 1000):
 def health():
     return {"ok": True}
 
+@app.get("/init/load")
+def init_load():
+    rows = []
+    for row in iter_rows(pages=10, size=1000):
+        rows.append(row)
+    return rows
+    
+    
 @app.get("/photo/street")
 def photo_street(addr: str, w: int = 600, h: int = 360, fov: int = 90, heading: int = 0, pitch: int = 0):
     loc = geocode_address(addr)
@@ -119,11 +127,11 @@ def photo_street(addr: str, w: int = 600, h: int = 360, fov: int = 90, heading: 
 def list_restaurants(
     q: Optional[str] = Query(None, description="가게명 부분검색"),
     area: Optional[str] = Query(None, description="지역 키워드들(쉼표구분). 예: 상일,고덕"),
-    kind: Optional[Literal["전체", "한식", "중식", "일식", "양식", "etc"]] = Query(None),
+    kind: Optional[Literal["전체", "한", "중", "일", "양", "etc"]] = Query(None),
     open_only: bool = Query(True),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    pages: int = Query(3, ge=1, le=50),   # 얼마나 페이지를 스캔할지 (너무 크면 느려짐/쿼터 소모)
+    pages: int = Query(10, ge=1, le=50),   # 얼마나 페이지를 스캔할지 (너무 크면 느려짐/쿼터 소모)
     size: int = Query(1000, ge=1, le=1000)
 ):
     # 필터 준비
@@ -142,8 +150,8 @@ def list_restaurants(
     for row in iter_rows(pages=pages, size=size):
         n = normalize_row(row)
 
-        # 1) 업종: kind가 None 이거나 "전체"면 모두 허용, 아니면 정확히 일치만
-        if kind not in (None, "전체") and n["kind"] != kind:
+        # 1) 업종: kind가 None 이거나 "전체"면 모두 허용, 아니면 한/중/일 이란 단어 포함시 허용
+        if kind not in (None, "전체") and not any(k in n["kind"] for k in kind):
             continue
 
         # 2) 영업 여부
@@ -167,9 +175,9 @@ def list_restaurants(
 @app.get("/restaurants/random")
 def random_restaurants(
     area: Optional[str] = None,
-    kind: Optional[Literal["전체","한식", "중식", "일식", "양식", "etc"]] = None,
+    kind: Optional[Literal["전체","한", "중", "일", "양", "etc"]] = None,
     open_only: bool = True,
-    pages: int = 3,
+    pages: int = 10,
     size: int = 1000,
     count: int = Query(5, ge=1, le=20, description="랜덤으로 뽑을 개수 (기본 5개)")
 ):
