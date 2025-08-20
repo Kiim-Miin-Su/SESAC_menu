@@ -86,7 +86,7 @@ def get_rows_range(start: int, end: int) -> list:
     rows = svc.get("row", []) or []
     return rows
 
-def iter_rows(pages: int = 10, size: int = 1000):
+def iter_rows(pages: int = 6, size: int = 1000):
     """
     필요한 만큼만 페이지 순회 (기본 3, 성능/쿼터 고려)
     """
@@ -106,10 +106,26 @@ def health():
 
 @app.get("/init/load")
 def init_load():
-    rows = []
-    for row in iter_rows(pages=10, size=1000):
-        rows.append(row)
-    return rows
+    rows_all = []
+    rows_ko = []
+    rows_ch = []
+    rows_jp = []
+    rows_en = []
+    rows_etc = []
+
+    for row in iter_rows(pages=6, size=1000):
+        rows_all.append(row)
+        if "한" in row.get("UPTAENM") :
+            rows_ko.append(row)
+        elif "중" in row.get("UPTAENM") :
+            rows_ch.append(row)
+        elif "일" in row.get("UPTAENM") :
+            rows_jp.append(row)
+        elif "양" in row.get("UPTAENM") :
+            rows_en.append(row)
+        else:
+            rows_etc.append(row)
+    return rows_ko
     
     
 @app.get("/photo/street")
@@ -131,7 +147,7 @@ def list_restaurants(
     open_only: bool = Query(True),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    pages: int = Query(10, ge=1, le=50),   # 얼마나 페이지를 스캔할지 (너무 크면 느려짐/쿼터 소모)
+    pages: int = Query(6, ge=1, le=50),   # 얼마나 페이지를 스캔할지 (너무 크면 느려짐/쿼터 소모)
     size: int = Query(1000, ge=1, le=1000)
 ):
     # 필터 준비
@@ -177,7 +193,7 @@ def random_restaurants(
     area: Optional[str] = None,
     kind: Optional[Literal["전체","한", "중", "일", "양", "etc"]] = None,
     open_only: bool = True,
-    pages: int = 10,
+    pages: int = 6,
     size: int = 1000,
     count: int = Query(5, ge=1, le=20, description="랜덤으로 뽑을 개수 (기본 5개)")
 ):
