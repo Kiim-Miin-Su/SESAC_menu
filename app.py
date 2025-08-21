@@ -39,12 +39,12 @@ class Config:
     MAX_EXCLUDE_PARAMS: int = 400
     ALLOWED_ORIGINS: List[str] = [
         "https://sesac-menu.pe.kr",  # 프론트 도메인
-        "http://localhost:5173",     # 로컬 개발(원하면 제거)
-        "http://127.0.0.1:5173",
+        "http://localhost:5500",     # 로컬 개발
+        "http://127.0.0.1:5500",
         "https://kiim-miin-su.github.io",
     ]
 
-    # 레이트리밋 정책(필요 시 조절)
+    # 레이트리밋 정책
     RL_GLOBAL_CAPACITY: int = 120
     RL_GLOBAL_REFILL: float = 1.5     # 초당 토큰(≈분당 90)
     RL_ROUTE_WINDOW: int = 60         # 초
@@ -106,14 +106,18 @@ class RestaurantClassifier:
 
     @classmethod
     def extract_coords(cls, row: dict) -> Tuple[Optional[float], Optional[float]]:
+        # 유효한 WGS84 경위도만 통과
         candidates = [("X", "Y"), ("LOC_X", "LOC_Y"), ("LON", "LAT"), ("longitude", "latitude")]
         for lx, ly in candidates:
             lon, lat = row.get(lx), row.get(ly)
-            if lon not in (None, "") and lat not in (None, ""):
-                try:
-                    return float(lon), float(lat)
-                except ValueError:
-                    pass
+            if lon in (None, "") or lat in (None, ""):
+                continue
+            try:
+                lon_f, lat_f = float(lon), float(lat)
+                if -180.0 <= lon_f <= 180.0 and -90.0 <= lat_f <= 90.0:
+                    return lon_f, lat_f
+            except ValueError:
+                continue
         return None, None
 
     @classmethod
@@ -137,10 +141,7 @@ def calc_distance(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     return R * c
 
 def make_key(item: Restaurant) -> str:
-    # 관리번호 있으면 고유키로 사용
-    if item.id:
-        return item.id
-    return f"{(item.name or '').strip()}|{(item.addr or '').strip()}"
+    return item.id.strip() if item.id else f"{(item.name or '').strip()}|{(item.addr or '').strip()}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 외부 API / 프리패치 캐시
@@ -204,8 +205,7 @@ class RestaurantCache:
             while True:
                 try:
                     self.refresh_once()
-                except Exception as e:
-                    # 조용히 재시도
+                except Exception:
                     pass
                 time.sleep(Config.CACHE_REFRESH_SEC)
         threading.Thread(target=_loop, daemon=True).start()
@@ -237,11 +237,7 @@ def geocode_address(addr: str):
 # FastAPI 앱/미들웨어
 # ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Seoul Food LocalData API", default_response_class=ORJSONResponse)
-
-# GZip
 app.add_middleware(GZipMiddleware, minimum_size=1024)
-
-# CORS — 반드시 프론트 도메인만 허용
 app.add_middleware(
     CORSMiddleware,
     allow_origins=Config.ALLOWED_ORIGINS,
@@ -349,7 +345,6 @@ async def rate_limit_middleware(request: Request, call_next):
 # ──────────────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def _startup():
-    # 첫 로드가 비어있지 않게 즉시 1회
     try:
         CACHE.refresh_once()
     finally:
@@ -361,7 +356,6 @@ def _startup():
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/robots.txt")
 def robots():
-    # 얌전한 크롤러는 줄어듭니다
     return ("User-agent: *\nDisallow: /\n", 200, {"Content-Type": "text/plain"})
 
 @app.get("/health")
@@ -392,7 +386,7 @@ def photo_street(
 @app.get("/restaurants", response_model=RestaurantResponse)
 def list_restaurants(
     q: Optional[str] = Query(None, description="가게명 부분검색"),
-    area: Optional[str] = Query(None, description="지역 키워드(쉼표구분) 예: 상일,고덕,천호"),
+    area: Optional[str] = Query(None, description="지역 키워드(쉼표구분) 예: 상일동,고덕동,천호동"),
     kind: Optional[Literal["전체", "한", "중", "일", "양", "카페", "호프통닭", "etc"]] = Query(None),
     open_only: bool = Query(True),
     limit: int = Query(20, ge=1, le=200),
@@ -400,19 +394,21 @@ def list_restaurants(
     curr_loc_x: Optional[float] = Query(None, description="현재 경도"),
     curr_loc_y: Optional[float] = Query(None, description="현재 위도"),
     distance: Optional[int] = Query(None, description="반경(m)"),
-    exclude: Optional[List[str]] = Query(None, description="이미 본 key 목록(name|addr 또는 id)"),
-    order: Optional[Literal["default", "rand"]] = Query("default"),
-    seed: Optional[int] = Query(None, description="order=rand 시 시드"),
+    order: Optional[Literal["default", "rand", "distance", "name"]] = Query("default"),
 ):
-    # exclude 너무 길면 뒤쪽 N개만 유지(쿼리 길이 보호)
-    if exclude and len(exclude) > Config.MAX_EXCLUDE_PARAMS:
-        exclude = exclude[-Config.MAX_EXCLUDE_PARAMS:]
-
-    # 지역 키워드 정규식
+    # 지역 정규식(동 단위로 엄격 매칭)
     area_patterns: List[re.Pattern] = []
     if area:
+        def build_area_regex(tok: str) -> re.Pattern:
+            base = tok.strip()
+            if not base:
+                return re.compile(r".*")
+            if not base.endswith("동"):
+                base += "동"
+            # “…구 상일동 123-” 같은 표준 주소에만 매칭, 상일로/역 제외
+            return re.compile(rf"{re.escape(base)}(?=\s*\d|$)")
         tokens = [t.strip() for t in area.split(",") if t.strip()]
-        area_patterns = [re.compile(re.escape(tok)) for tok in tokens]
+        area_patterns = [build_area_regex(t) for t in tokens]
 
     def area_match(addr: str) -> bool:
         if not area_patterns:
@@ -426,21 +422,14 @@ def list_restaurants(
             return category not in {"한", "중", "일", "양", "카페", "호프통닭"}
         return category == kind
 
-    exclude_set = set(exclude or [])
-    need_dist = (curr_loc_x is not None and curr_loc_y is not None and distance is not None)
-
-    items: List[Dict[str, Any]] = []
     rows = CACHE.get()
-    if order == "rand":
-        rng = pyrandom.Random(seed) if seed is not None else pyrandom
-        rows = rows.copy()
-        rng.shuffle(rows)
 
+    # q/name 부분검색을 위해 미리 소문자
     q_norm = (q or "").lower()
 
+    # 1차 필터링 (영업/카테고리/지역/부분검색)
+    filtered: List[Restaurant] = []
     for r in rows:
-        if exclude_set and (make_key(r) in exclude_set or r.id in exclude_set):
-            continue
         if open_only and not r.open:
             continue
         if not kind_match(r.category):
@@ -449,14 +438,31 @@ def list_restaurants(
             continue
         if q and (q_norm not in (r.name or "").lower()):
             continue
+        filtered.append(r)
 
-        # 거리 필터: 좌표 없으면 통과(데이터 누락 방지; 원하면 제외로 바꿔도 됨)
-        if need_dist and r.loc_x is not None and r.loc_y is not None:
-            d = calc_distance(curr_loc_x, curr_loc_y, r.loc_x, r.loc_y)
-            if d > float(distance):
+    # 거리 기준 활성 여부
+    need_dist = (curr_loc_x is not None and curr_loc_y is not None and distance is not None)
+
+    # 2차: 거리 필터(‘엄격’) — 좌표 없으면 제외
+    if need_dist:
+        tmp: List[Tuple[Restaurant, float]] = []
+        for r in filtered:
+            if r.loc_x is None or r.loc_y is None:
                 continue
-
-        items.append({
+            d = calc_distance(curr_loc_x, curr_loc_y, r.loc_x, r.loc_y)
+            if d <= float(distance):
+                tmp.append((r, d))
+        # 정렬
+        if order in ("distance", "default"):
+            tmp.sort(key=lambda x: x[1])
+        elif order == "name":
+            tmp.sort(key=lambda x: (x[0].name or ""))
+        elif order == "rand":
+            pyrandom.shuffle(tmp)
+        # 페이징
+        total = len(tmp)
+        sliced = tmp[offset: offset + limit]
+        items = [{
             "id": r.id,
             "name": r.name,
             "open": r.open,
@@ -465,10 +471,29 @@ def list_restaurants(
             "category": r.category,
             "loc_x": r.loc_x,
             "loc_y": r.loc_y,
-        })
+            # "distance_m": d,  # 필요하면 주석 해제
+        } for (r, d) in sliced]
+        return RestaurantResponse(total=total, count=len(items), items=items)
 
-    total = len(items)
-    items = items[offset: offset + limit]
+    # 거리 필터가 없을 때 정렬
+    if order == "name":
+        filtered.sort(key=lambda r: (r.name or ""))
+    elif order == "rand":
+        pyrandom.shuffle(filtered)
+    # default: 캐시 순서 유지
+
+    total = len(filtered)
+    page = filtered[offset: offset + limit]
+    items = [{
+        "id": r.id,
+        "name": r.name,
+        "open": r.open,
+        "addr": r.addr,
+        "kind": r.kind,
+        "category": r.category,
+        "loc_x": r.loc_x,
+        "loc_y": r.loc_y,
+    } for r in page]
     return RestaurantResponse(total=total, count=len(items), items=items)
 
 @app.get("/restaurants/random", response_model=RandomResponse)
